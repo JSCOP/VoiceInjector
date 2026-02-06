@@ -1,6 +1,7 @@
-# Audio capture
+# Audio capture & control
 sounddevice>=0.4.6
 numpy>=1.24.0
+pycaw>=20230407
 
 # Voice Activity Detection
 webrtcvad>=2.0.10

@@ -9,6 +9,8 @@ audio:
   chunk_duration_ms: 30
   # Device index (null = system default microphone)
   device_index: null
+  # Mute system speakers while recording (prevents audio bleed into mic)
+  mute_speaker_on_record: true
 
 stt:
   # Whisper model size: tiny, base, small, medium, large-v3, large-v3-turbo

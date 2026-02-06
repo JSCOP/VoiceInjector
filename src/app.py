@@ -10,6 +10,7 @@ import time
 from typing import Optional
 
 from src.audio.capture import AudioCapture
+from src.audio.mute_control import MuteControl
 from src.audio.vad import VoiceActivityDetector
 from src.config_loader import AppConfig, load_config
 from src.injector.text_injector import TextInjector
@@ -75,6 +76,8 @@ class VoiceInjectorApp:
             add_trailing_newline=self.config.injector.add_trailing_newline,
         )
 
+        self._mute = MuteControl(enabled=self.config.audio.mute_speaker_on_record)
+
         self._hotkeys = HotkeyManager()
 
         self._overlay = OverlayWindow()
@@ -114,6 +117,7 @@ class VoiceInjectorApp:
             return
 
         self._is_recording = True
+        self._mute.mute()  # Mute speakers to avoid interference
         self._vad.reset()
         self._audio.start_buffering()
         self._tray.update_status("listening")
@@ -126,6 +130,7 @@ class VoiceInjectorApp:
             return
 
         self._is_recording = False
+        self._mute.unmute()  # Restore speakers
         logger.info("Push-to-talk: RELEASED - processing audio...")
 
         # Get buffered audio
@@ -196,6 +201,9 @@ class VoiceInjectorApp:
         logger.info("Loading speech recognition model (this may take a moment)...")
         self._stt.load_model()
 
+        # Initialize speaker mute control
+        self._mute.initialize()
+
         # Start audio stream
         self._audio.start_stream()
 
@@ -239,6 +247,7 @@ class VoiceInjectorApp:
         logger.info("Shutting down Voice Injector...")
         self._running = False
 
+        self._mute.force_unmute()  # Safety: ensure speakers are unmuted on exit
         self._hotkeys.stop()
         self._audio.stop_stream()
         self._overlay.stop()

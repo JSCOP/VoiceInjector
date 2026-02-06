@@ -18,6 +18,7 @@ class AudioConfig:
     channels: int = 1
     chunk_duration_ms: int = 30
     device_index: Optional[int] = None
+    mute_speaker_on_record: bool = True
 
 
 @dataclass
@@ -93,6 +94,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
                 channels=a.get("channels", 1),
                 chunk_duration_ms=a.get("chunk_duration_ms", 30),
                 device_index=a.get("device_index"),
+                mute_speaker_on_record=a.get("mute_speaker_on_record", True),
             )
 
         # STT config
