@@ -1,0 +1,19 @@
+# Audio capture
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Voice Activity Detection
+webrtcvad>=2.0.10
+
+# Speech-to-Text (local Whisper)
+faster-whisper>=1.0.0
+
+# Keyboard simulation & hotkeys
+pynput>=1.7.6
+
+# System tray
+pystray>=0.19.5
+Pillow>=10.0.0
+
+# Config
+pyyaml>=6.0.1

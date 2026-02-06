@@ -1,0 +1,56 @@
+# Voice Injector Configuration
+
+audio:
+  # Sample rate in Hz (16000 is optimal for Whisper)
+  sample_rate: 16000
+  # Number of audio channels (1 = mono, required for Whisper)
+  channels: 1
+  # Audio chunk duration in milliseconds for VAD processing
+  chunk_duration_ms: 30
+  # Device index (null = system default microphone)
+  device_index: null
+
+stt:
+  # Whisper model size: tiny, base, small, medium, large-v3, large-v3-turbo
+  # RTX 5080 GPU: "large-v3-turbo" (best accuracy + fast)
+  model_size: large-v3-turbo
+  # Device for inference: "cpu" or "cuda" (GPU)
+  device: cuda
+  # Compute type: "float16" (GPU optimal), "int8" (CPU), "float32" (fallback)
+  compute_type: float16
+  # Default task: "transcribe" (as-is) or "translate" (everything to English)
+  default_task: transcribe
+  # Language hint (null = auto-detect, "ko" = Korean, "en" = English)
+  # null = auto-detect (GPU fast enough for auto-detect now)
+  language: null
+  # Beam size for decoding (higher = more accurate but slower)
+  beam_size: 5
+  # Initial prompt to guide Whisper (helps with code-switching and technical terms)
+  # This tells Whisper to expect mixed Korean/English with tech terms
+  initial_prompt: "한국어와 English가 섞인 대화. Technical terms like API, GPU, framework, register, rendering, shader를 자주 사용합니다."
+
+vad:
+  # VAD aggressiveness (0-3, higher = more aggressive filtering of non-speech)
+  aggressiveness: 2
+  # Minimum speech duration in seconds to trigger transcription
+  min_speech_duration: 0.5
+  # Silence duration in seconds to consider speech ended
+  silence_duration: 0.8
+  # Pre-speech padding in seconds (captures audio slightly before speech detected)
+  pre_speech_pad: 0.3
+
+hotkeys:
+  # Push-to-talk hotkey (hold to record)
+  push_to_talk: win+ctrl
+  # Toggle transcribe/translate mode
+  toggle_mode: win+shift
+  # Quick quit
+  quit: ctrl+shift+q
+
+injector:
+  # Delay between keystrokes in seconds (0.0 = instant)
+  keystroke_delay: 0.005
+  # Add a trailing space after injection
+  add_trailing_space: true
+  # Add newline after injection
+  add_trailing_newline: false
