@@ -82,6 +82,9 @@ class VoiceInjectorApp:
 
         self._overlay = OverlayWindow()
 
+        # Wire audio levels from capture to overlay for waveform visualization
+        self._audio.set_level_callback(self._overlay.push_audio_level)
+
         self._tray = SystemTray(
             on_toggle_mode=self._toggle_mode,
             on_quit=self.stop,
@@ -117,6 +120,8 @@ class VoiceInjectorApp:
             return
 
         self._is_recording = True
+        # Play start sound BEFORE muting — blocks until sound finishes
+        self._overlay.play_start_sound()
         self._mute.mute()  # Mute speakers to avoid interference
         self._vad.reset()
         self._audio.start_buffering()
@@ -130,11 +135,14 @@ class VoiceInjectorApp:
             return
 
         self._is_recording = False
-        self._mute.unmute()  # Restore speakers
         logger.info("Push-to-talk: RELEASED - processing audio...")
 
         # Get buffered audio
         audio_data = self._audio.stop_buffering()
+
+        # Unmute speakers THEN play stop sound so the user can hear it
+        self._mute.unmute()
+        self._overlay.play_stop_sound()
 
         if not audio_data or len(audio_data) < 1000:
             logger.info("No significant audio captured, skipping")

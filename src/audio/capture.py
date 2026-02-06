@@ -36,6 +36,9 @@ class AudioCapture:
         # Callback for delivering audio chunks
         self._on_audio_chunk: Optional[Callable[[bytes], None]] = None
 
+        # Callback for audio level (0.0 - 1.0 RMS)
+        self._on_audio_level: Optional[Callable[[float], None]] = None
+
         # Stream reference
         self._stream: Optional[sd.RawInputStream] = None
         self._is_recording = False
@@ -45,9 +48,17 @@ class AudioCapture:
         self._audio_buffer: list[bytes] = []
         self._is_buffering = False
 
+        # Adaptive RMS tracking for level normalization
+        # Start at a reasonable default so first few frames aren't spiked
+        self._rms_peak: float = 50.0
+
     def set_audio_callback(self, callback: Callable[[bytes], None]):
         """Set the callback function that receives raw audio chunks (16-bit PCM)."""
         self._on_audio_chunk = callback
+
+    def set_level_callback(self, callback: Callable[[float], None]):
+        """Set a callback that receives normalized RMS audio level (0.0 - 1.0)."""
+        self._on_audio_level = callback
 
     def _audio_callback(self, indata, frames, time_info, status):
         """Internal sounddevice callback - runs in audio thread."""
@@ -60,8 +71,35 @@ class AudioCapture:
         if self._on_audio_chunk:
             self._on_audio_chunk(raw_bytes)
 
+        # Calculate and report audio level during buffering
         if self._is_buffering:
             self._audio_buffer.append(raw_bytes)
+
+            if self._on_audio_level:
+                try:
+                    samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(
+                        np.float32
+                    )
+                    rms = np.sqrt(np.mean(samples**2))
+
+                    # Adaptive normalization: track running peak RMS
+                    # This auto-scales to any mic volume (even very quiet
+                    # virtual devices like SteelSeries Sonar)
+                    if rms > self._rms_peak:
+                        # Ramp UP quickly when louder audio comes in
+                        self._rms_peak = rms
+                    else:
+                        # Decay slowly so brief pauses don't spike
+                        self._rms_peak *= 0.998
+
+                    # Normalize against peak with perceptual curve
+                    if self._rms_peak > 0.1:
+                        level = min(1.0, (rms / self._rms_peak) ** 0.5)
+                    else:
+                        level = 0.0
+                    self._on_audio_level(level)
+                except Exception as e:
+                    logger.debug(f"Audio level callback error: {e}")
 
     def start_stream(self):
         """Start the audio input stream."""
@@ -105,6 +143,7 @@ class AudioCapture:
     def start_buffering(self):
         """Start buffering audio data (for push-to-talk)."""
         self._audio_buffer.clear()
+        self._rms_peak = 50.0  # Reset to conservative default (adapts up quickly)
         self._is_buffering = True
         logger.debug("Audio buffering started")
 
