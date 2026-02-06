@@ -60,6 +60,24 @@ class STTEngine:
         """Load the Whisper model and translator."""
         from faster_whisper import WhisperModel
 
+        # Auto-detect GPU if configured for cuda
+        if self.device == "cuda":
+            try:
+                import ctranslate2
+
+                if ctranslate2.get_cuda_device_count() == 0:
+                    logger.warning(
+                        "CUDA requested but no GPU found. Falling back to CPU."
+                    )
+                    self.device = "cpu"
+                    self.compute_type = "int8"
+                    self.model_size = "base"  # Large model too slow on CPU
+            except Exception:
+                logger.warning("CUDA check failed. Falling back to CPU.")
+                self.device = "cpu"
+                self.compute_type = "int8"
+                self.model_size = "base"
+
         logger.info(
             f"Loading Whisper model '{self.model_size}' "
             f"(device={self.device}, compute={self.compute_type})..."

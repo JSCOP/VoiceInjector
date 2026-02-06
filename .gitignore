@@ -3,3 +3,8 @@
 models/
 __pycache__/
 *.pyc
+build/
+dist/
+*.spec
+test_*.py
+voice_injector.log

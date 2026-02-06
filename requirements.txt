@@ -15,5 +15,8 @@ pynput>=1.7.6
 pystray>=0.19.5
 Pillow>=10.0.0
 
+# Translation (Korean → English)
+deep-translator>=1.11.0
+
 # Config
 pyyaml>=6.0.1
