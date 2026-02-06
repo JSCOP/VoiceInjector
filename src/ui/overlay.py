@@ -1,17 +1,17 @@
 """
-Floating overlay window at the bottom of the screen.
-Shows recording status, processing indicator, transcribed text,
-and a visible translate ON/OFF toggle.
+Floating overlay UI inspired by Wispr Flow.
 
-Auto-hide behavior:
-- Full UI appears when recording/processing/showing results
-- After 10 seconds of idle, shrinks to a tiny dot indicator
-- Dot shows current mode color (gray=transcribe, blue=translate)
-- Any activity brings the full UI back
+Design: Dark pill-shaped capsule at bottom-center of screen.
+- Minimal, no text clutter
+- Animated dots during recording
+- Spinner during processing
+- Brief text flash for results
+- Auto-hides to tiny dot after 1 second of idle
 """
 
 import ctypes
 import logging
+import math
 import queue
 import threading
 import tkinter as tk
@@ -19,360 +19,315 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Win32 constants for click-through window
+# Win32
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_TOPMOST = 0x00000008
 WS_EX_NOACTIVATE = 0x08000000
 
-# Colors
-COLOR_BG_IDLE = "#1E1E1E"
-COLOR_BG_RECORDING = "#0D2818"
-COLOR_BG_PROCESSING = "#2D1B00"
-COLOR_BG_ERROR = "#2D0A0A"
-COLOR_BG_MINI = "#1A1A1A"
-
-COLOR_TEXT_IDLE = "#888888"
-COLOR_TEXT_RECORDING = "#00FF88"
-COLOR_TEXT_PROCESSING = "#FFB347"
-COLOR_TEXT_RESULT = "#FFFFFF"
-COLOR_TEXT_ERROR = "#FF4444"
-
-COLOR_TRANSLATE_ON_BG = "#1A3A5C"
-COLOR_TRANSLATE_ON_FG = "#4DB8FF"
-COLOR_TRANSLATE_OFF_BG = "#2A2A2A"
-COLOR_TRANSLATE_OFF_FG = "#666666"
-
-COLOR_BORDER = "#3A3A3A"
-
-RECORDING_DOTS = ["", ".", "..", "..."]
-
-# Timings
-AUTO_HIDE_DELAY_MS = 10000  # 10 seconds idle -> shrink to mini
-RESULT_DISPLAY_MS = 3000  # Show result for 3 seconds
-ERROR_DISPLAY_MS = 4000  # Show error for 4 seconds
+# Palette
+BG = "#0D0D0D"
+BG_BORDER = "#1A1A1A"
+BG_PILL = "#141414"
+DOT_IDLE = "#333333"
+DOT_RECORDING = "#E8B634"
+DOT_PROCESSING = "#7EB8DA"
+DOT_RESULT = "#4ADE80"
+DOT_ERROR = "#EF4444"
+TEXT_DIM = "#555555"
+TEXT_RESULT = "#E0E0E0"
+TRANSLATE_ON = "#4DB8FF"
+TRANSLATE_OFF = "#444444"
 
 # Sizes
-FULL_WIDTH = 520
-FULL_HEIGHT = 64
-MINI_WIDTH = 28
-MINI_HEIGHT = 28
+PILL_WIDTH = 280
+PILL_HEIGHT = 44
+PILL_RADIUS = 22
+MINI_SIZE = 14
+
+# Timing
+AUTO_HIDE_MS = 1000
 
 
 class OverlayWindow:
-    """
-    Floating overlay with auto-hide behavior.
-
-    Full mode:
-    ┌─────────────────────────────────────────────────────────┐
-    │  ● Ready                    [KO/EN] [Translate: OFF]    │
-    │  Win+Ctrl to speak  |  Win+Shift to toggle translate    │
-    └─────────────────────────────────────────────────────────┘
-
-    Mini mode (after 10s idle):
-    ┌──┐
-    │ ●│  (tiny dot, shows mode color)
-    └──┘
-    """
-
     def __init__(self):
         self._root: Optional[tk.Tk] = None
         self._thread: Optional[threading.Thread] = None
-        self._command_queue: queue.Queue = queue.Queue()
+        self._queue: queue.Queue = queue.Queue()
         self._running = False
         self._ready = threading.Event()
 
-        # State
         self._current_mode = "transcribe"
         self._current_state = "idle"
         self._is_mini = False
-        self._dot_index = 0
+        self._anim_index = 0
+        self._anim_id = None
+        self._hide_timer_id = None
         self._result_timer_id = None
-        self._auto_hide_timer_id = None
 
-        # UI elements
-        self._status_label: Optional[tk.Label] = None
-        self._translate_badge: Optional[tk.Label] = None
-        self._lang_badge: Optional[tk.Label] = None
-        self._text_label: Optional[tk.Label] = None
+        # Canvas elements
         self._canvas: Optional[tk.Canvas] = None
-        self._dot_indicator: Optional[int] = None
-
-        # Mini mode elements
         self._mini_canvas: Optional[tk.Canvas] = None
-        self._mini_dot: Optional[int] = None
-
-        # Frames
+        self._mini_dot = None
         self._full_frame: Optional[tk.Frame] = None
         self._mini_frame: Optional[tk.Frame] = None
 
-        # Screen position
         self._screen_w = 0
         self._screen_h = 0
+
+    # ── Public API ──
 
     def start(self):
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._run_tk, daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         self._ready.wait(timeout=5)
-        logger.info("Overlay window started")
 
     def stop(self):
         self._running = False
-        self._send_command("quit")
+        self._cmd("quit")
         if self._thread:
             self._thread.join(timeout=3)
-        logger.info("Overlay window stopped")
 
     def show_idle(self):
-        self._send_command("idle")
+        self._cmd("idle")
 
     def show_recording(self):
-        self._send_command("recording")
+        self._cmd("recording")
 
     def show_processing(self):
-        self._send_command("processing")
+        self._cmd("processing")
 
     def show_result(self, text: str):
-        self._send_command("result", text)
+        self._cmd("result", text)
 
-    def show_error(self, message: str):
-        self._send_command("error", message)
+    def show_error(self, msg: str):
+        self._cmd("error", msg)
 
     def update_mode(self, mode: str):
         self._current_mode = mode
-        self._send_command("mode", mode)
+        self._cmd("mode", mode)
 
-    def _send_command(self, cmd: str, data: str = ""):
+    def _cmd(self, c: str, d: str = ""):
         try:
-            self._command_queue.put_nowait((cmd, data))
+            self._queue.put_nowait((c, d))
         except queue.Full:
             pass
 
-    # ── Tkinter setup ──
+    # ── Tkinter ──
 
-    def _run_tk(self):
+    def _run(self):
         try:
             self._root = tk.Tk()
-            self._setup_window()
-            self._build_full_ui()
-            self._build_mini_ui()
-            self._make_click_through()
-            self._root.after(50, self._poll_commands)
-            # Start auto-hide timer
-            self._start_auto_hide_timer()
+            self._setup()
+            self._build()
+            self._click_through()
+            self._root.after(50, self._poll)
+            self._start_hide_timer()
             self._ready.set()
             self._root.mainloop()
         except Exception as e:
-            logger.error(f"Overlay window error: {e}", exc_info=True)
+            logger.error(f"Overlay error: {e}", exc_info=True)
             self._ready.set()
 
-    def _setup_window(self):
-        root = self._root
-        root.title("Voice Injector")
-        root.overrideredirect(True)
-        root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.92)
-        root.configure(bg=COLOR_BG_IDLE)
+    def _setup(self):
+        r = self._root
+        r.title("VI")
+        r.overrideredirect(True)
+        r.attributes("-topmost", True)
+        r.attributes("-alpha", 0.95)
+        r.configure(bg=BG)
 
-        self._screen_w = root.winfo_screenwidth()
-        self._screen_h = root.winfo_screenheight()
+        self._screen_w = r.winfo_screenwidth()
+        self._screen_h = r.winfo_screenheight()
 
-        x = (self._screen_w - FULL_WIDTH) // 2
-        y = self._screen_h - FULL_HEIGHT - 60
+        x = (self._screen_w - PILL_WIDTH) // 2
+        y = self._screen_h - PILL_HEIGHT - 70
+        r.geometry(f"{PILL_WIDTH}x{PILL_HEIGHT}+{x}+{y}")
 
-        root.geometry(f"{FULL_WIDTH}x{FULL_HEIGHT}+{x}+{y}")
-        root.resizable(False, False)
-
-    def _build_full_ui(self):
-        """Build the full-size overlay UI."""
-        root = self._root
-
-        # Full mode container
-        self._full_frame = tk.Frame(root, bg=COLOR_BORDER, padx=1, pady=1)
+    def _build(self):
+        # ── Full mode: pill canvas ──
+        self._full_frame = tk.Frame(self._root, bg=BG)
         self._full_frame.pack(fill=tk.BOTH, expand=True)
 
-        frame = tk.Frame(self._full_frame, bg=COLOR_BG_IDLE, padx=12, pady=6)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        # Top row
-        top_frame = tk.Frame(frame, bg=COLOR_BG_IDLE)
-        top_frame.pack(fill=tk.X)
-
         self._canvas = tk.Canvas(
-            top_frame, width=14, height=14, bg=COLOR_BG_IDLE, highlightthickness=0
+            self._full_frame,
+            width=PILL_WIDTH,
+            height=PILL_HEIGHT,
+            bg=BG,
+            highlightthickness=0,
         )
-        self._canvas.pack(side=tk.LEFT, padx=(0, 6), pady=2)
-        self._dot_indicator = self._canvas.create_oval(
-            2, 2, 12, 12, fill=COLOR_TEXT_IDLE, outline=""
-        )
+        self._canvas.pack()
 
-        self._status_label = tk.Label(
-            top_frame,
-            text="Ready",
-            font=("Segoe UI", 11, "bold"),
-            fg=COLOR_TEXT_IDLE,
-            bg=COLOR_BG_IDLE,
-            anchor="w",
-        )
-        self._status_label.pack(side=tk.LEFT, padx=(0, 8))
+        # Draw pill background
+        self._draw_pill(0, 0, PILL_WIDTH, PILL_HEIGHT, PILL_RADIUS, BG_PILL, BG_BORDER)
 
-        self._translate_badge = tk.Label(
-            top_frame,
-            text="  Translate: OFF  ",
-            font=("Segoe UI", 8, "bold"),
-            fg=COLOR_TRANSLATE_OFF_FG,
-            bg=COLOR_TRANSLATE_OFF_BG,
-            padx=8,
-            pady=2,
-        )
-        self._translate_badge.pack(side=tk.RIGHT, padx=(4, 0))
-
-        self._lang_badge = tk.Label(
-            top_frame,
-            text=" KO / EN ",
-            font=("Segoe UI", 8),
-            fg="#999999",
-            bg="#2A2A2A",
-            padx=6,
-            pady=2,
-        )
-        self._lang_badge.pack(side=tk.RIGHT, padx=(4, 0))
-
-        self._text_label = tk.Label(
-            frame,
-            text="Win+Ctrl to speak  |  Win+Shift to toggle translate",
-            font=("Segoe UI", 9),
-            fg="#555555",
-            bg=COLOR_BG_IDLE,
-            anchor="w",
-            wraplength=490,
-        )
-        self._text_label.pack(fill=tk.X, pady=(4, 0))
-
-        self._frame = frame
-        self._top_frame = top_frame
-
-    def _build_mini_ui(self):
-        """Build the mini dot indicator (hidden initially)."""
-        self._mini_frame = tk.Frame(self._root, bg=COLOR_BG_MINI, padx=2, pady=2)
-        # Don't pack yet - it's hidden
-
+        # ── Mini mode: tiny dot ──
+        self._mini_frame = tk.Frame(self._root, bg=BG)
         self._mini_canvas = tk.Canvas(
             self._mini_frame,
-            width=20,
-            height=20,
-            bg=COLOR_BG_MINI,
+            width=MINI_SIZE,
+            height=MINI_SIZE,
+            bg=BG,
             highlightthickness=0,
         )
         self._mini_canvas.pack()
         self._mini_dot = self._mini_canvas.create_oval(
-            4, 4, 18, 18, fill=COLOR_TEXT_IDLE, outline="#333333", width=1
+            2, 2, MINI_SIZE - 2, MINI_SIZE - 2, fill=DOT_IDLE, outline=""
         )
 
-    def _make_click_through(self):
+        # Initial: draw idle dots
+        self._draw_idle_dots()
+
+    def _draw_pill(self, x1, y1, x2, y2, r, fill, outline):
+        """Draw a rounded rectangle (pill shape) on canvas."""
+        c = self._canvas
+        # Using arcs and rectangles for rounded corners
+        c.create_arc(
+            x1,
+            y1,
+            x1 + 2 * r,
+            y1 + 2 * r,
+            start=90,
+            extent=90,
+            fill=fill,
+            outline=outline,
+            width=1,
+        )
+        c.create_arc(
+            x2 - 2 * r,
+            y1,
+            x2,
+            y1 + 2 * r,
+            start=0,
+            extent=90,
+            fill=fill,
+            outline=outline,
+            width=1,
+        )
+        c.create_arc(
+            x1,
+            y2 - 2 * r,
+            x1 + 2 * r,
+            y2,
+            start=180,
+            extent=90,
+            fill=fill,
+            outline=outline,
+            width=1,
+        )
+        c.create_arc(
+            x2 - 2 * r,
+            y2 - 2 * r,
+            x2,
+            y2,
+            start=270,
+            extent=90,
+            fill=fill,
+            outline=outline,
+            width=1,
+        )
+        # Fill center
+        c.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline="")
+        c.create_rectangle(x1, y1 + r, x1 + r, y2 - r, fill=fill, outline="")
+        c.create_rectangle(x2 - r, y1 + r, x2, y2 - r, fill=fill, outline="")
+        # Border lines
+        c.create_line(x1 + r, y1, x2 - r, y1, fill=outline)
+        c.create_line(x1 + r, y2, x2 - r, y2, fill=outline)
+        c.create_line(x1, y1 + r, x1, y2 - r, fill=outline)
+        c.create_line(x2, y1 + r, x2, y2 - r, fill=outline)
+
+    def _click_through(self):
         try:
             hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
             style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            style = (
-                style
-                | WS_EX_LAYERED
-                | WS_EX_TRANSPARENT
-                | WS_EX_TOOLWINDOW
-                | WS_EX_NOACTIVATE
+            style |= (
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
             )
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-        except Exception as e:
-            logger.warning(f"Could not set click-through: {e}")
+        except Exception:
+            pass
 
-    # ── Show/Hide transitions ──
+    # ── Mode switching ──
 
-    def _switch_to_full(self):
-        """Switch from mini to full overlay."""
+    def _to_full(self):
         if not self._is_mini:
             return
         self._is_mini = False
-
         self._mini_frame.pack_forget()
         self._full_frame.pack(fill=tk.BOTH, expand=True)
+        x = (self._screen_w - PILL_WIDTH) // 2
+        y = self._screen_h - PILL_HEIGHT - 70
+        self._root.geometry(f"{PILL_WIDTH}x{PILL_HEIGHT}+{x}+{y}")
+        self._root.attributes("-alpha", 0.95)
 
-        x = (self._screen_w - FULL_WIDTH) // 2
-        y = self._screen_h - FULL_HEIGHT - 60
-        self._root.geometry(f"{FULL_WIDTH}x{FULL_HEIGHT}+{x}+{y}")
-        self._root.attributes("-alpha", 0.92)
-
-        logger.debug("Overlay: full mode")
-
-    def _switch_to_mini(self):
-        """Switch from full to mini dot indicator."""
-        if self._is_mini:
+    def _to_mini(self):
+        if self._is_mini or self._current_state != "idle":
             return
-        if self._current_state != "idle":
-            return  # Don't hide during active states
-
         self._is_mini = True
-
         self._full_frame.pack_forget()
         self._mini_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Position: bottom-center, small
-        x = (self._screen_w - MINI_WIDTH) // 2
-        y = self._screen_h - MINI_HEIGHT - 65
-        self._root.geometry(f"{MINI_WIDTH}x{MINI_HEIGHT}+{x}+{y}")
-        self._root.attributes("-alpha", 0.7)
-
-        # Update mini dot color based on mode
-        if self._current_mode == "translate":
-            self._mini_canvas.itemconfig(self._mini_dot, fill=COLOR_TRANSLATE_ON_FG)
-        else:
-            self._mini_canvas.itemconfig(self._mini_dot, fill=COLOR_TEXT_IDLE)
-
-        logger.debug("Overlay: mini mode")
+        x = (self._screen_w - MINI_SIZE) // 2
+        y = self._screen_h - MINI_SIZE - 75
+        self._root.geometry(f"{MINI_SIZE}x{MINI_SIZE}+{x}+{y}")
+        self._root.attributes("-alpha", 0.6)
+        # Update mini dot color
+        color = TRANSLATE_ON if self._current_mode == "translate" else DOT_IDLE
+        self._mini_canvas.itemconfig(self._mini_dot, fill=color)
 
     def _ensure_full(self):
-        """Make sure we're in full mode (for any active state)."""
         if self._is_mini:
-            self._switch_to_full()
-        self._cancel_auto_hide_timer()
+            self._to_full()
+        self._cancel_hide_timer()
 
-    # ── Auto-hide timer ──
+    # ── Timers ──
 
-    def _start_auto_hide_timer(self):
-        """Start the auto-hide countdown (10 seconds)."""
-        self._cancel_auto_hide_timer()
-        self._auto_hide_timer_id = self._root.after(
-            AUTO_HIDE_DELAY_MS, self._switch_to_mini
-        )
+    def _start_hide_timer(self):
+        self._cancel_hide_timer()
+        self._hide_timer_id = self._root.after(AUTO_HIDE_MS, self._to_mini)
 
-    def _cancel_auto_hide_timer(self):
-        if self._auto_hide_timer_id is not None:
+    def _cancel_hide_timer(self):
+        if self._hide_timer_id:
             try:
-                self._root.after_cancel(self._auto_hide_timer_id)
+                self._root.after_cancel(self._hide_timer_id)
             except Exception:
                 pass
-            self._auto_hide_timer_id = None
+            self._hide_timer_id = None
 
-    # ── Command polling ──
+    def _cancel_result_timer(self):
+        if self._result_timer_id:
+            try:
+                self._root.after_cancel(self._result_timer_id)
+            except Exception:
+                pass
+            self._result_timer_id = None
 
-    def _poll_commands(self):
+    def _cancel_anim(self):
+        if self._anim_id:
+            try:
+                self._root.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+
+    # ── Poll ──
+
+    def _poll(self):
         if not self._running:
             self._root.quit()
             return
-
         try:
             while True:
-                cmd, data = self._command_queue.get_nowait()
-                self._handle_command(cmd, data)
+                c, d = self._queue.get_nowait()
+                self._handle(c, d)
         except queue.Empty:
             pass
+        self._root.after(50, self._poll)
 
-        self._root.after(50, self._poll_commands)
-
-    def _handle_command(self, cmd: str, data: str):
+    def _handle(self, cmd, data):
         if cmd == "quit":
             self._running = False
             self._root.quit()
@@ -389,136 +344,187 @@ class OverlayWindow:
         elif cmd == "mode":
             self._set_mode(data)
 
-    # ── State handlers ──
+    # ── Drawing helpers ──
 
-    def _set_bg(self, color: str):
-        self._root.configure(bg=color)
-        self._full_frame.configure(bg=COLOR_BORDER)
-        self._frame.configure(bg=color)
-        self._top_frame.configure(bg=color)
-        self._status_label.configure(bg=color)
-        self._text_label.configure(bg=color)
-        self._canvas.configure(bg=color)
+    def _clear_content(self):
+        """Remove all dynamic content from canvas (keep pill background)."""
+        self._cancel_anim()
+        for tag in ("dots", "text", "spinner", "icon"):
+            self._canvas.delete(tag)
+
+    def _draw_dots(self, count=12, color=DOT_IDLE, spacing=12):
+        """Draw a row of dots in the center of the pill."""
+        total_w = (count - 1) * spacing
+        start_x = (PILL_WIDTH - total_w) / 2
+        cy = PILL_HEIGHT / 2
+        for i in range(count):
+            x = start_x + i * spacing
+            r = 2.5
+            self._canvas.create_oval(
+                x - r, cy - r, x + r, cy + r, fill=color, outline="", tags="dots"
+            )
+
+    def _draw_idle_dots(self):
+        """Draw dim dots for idle state."""
+        self._clear_content()
+        self._draw_dots(12, DOT_IDLE)
+        # Translate indicator on the right
+        self._draw_mode_icon()
+
+    def _draw_mode_icon(self):
+        """Draw a small mode indicator icon on the right side of the pill."""
+        cx = PILL_WIDTH - 30
+        cy = PILL_HEIGHT / 2
+        color = TRANSLATE_ON if self._current_mode == "translate" else "#2A2A2A"
+
+        # Small diamond/star shape
+        size = 5
+        points = []
+        for i in range(8):
+            angle = math.pi * i / 4
+            r = size if i % 2 == 0 else size * 0.4
+            points.append(cx + r * math.cos(angle))
+            points.append(cy + r * math.sin(angle))
+        self._canvas.create_polygon(points, fill=color, outline="", tags="icon")
+
+    # ── State renderers ──
 
     def _set_idle(self):
         self._current_state = "idle"
         self._cancel_result_timer()
         self._ensure_full()
-        self._set_bg(COLOR_BG_IDLE)
-        self._canvas.itemconfig(self._dot_indicator, fill=COLOR_TEXT_IDLE)
-        self._status_label.configure(text="Ready", fg=COLOR_TEXT_IDLE)
-        self._text_label.configure(
-            text="Win+Ctrl to speak  |  Win+Shift to toggle translate",
-            fg="#555555",
-        )
-        # Start auto-hide countdown
-        self._start_auto_hide_timer()
+        self._draw_idle_dots()
+        self._start_hide_timer()
 
     def _set_recording(self):
         self._current_state = "recording"
         self._cancel_result_timer()
         self._ensure_full()
-        self._set_bg(COLOR_BG_RECORDING)
-        self._canvas.itemconfig(self._dot_indicator, fill=COLOR_TEXT_RECORDING)
-        self._status_label.configure(text="Recording...", fg=COLOR_TEXT_RECORDING)
-        self._text_label.configure(text="Speak now...", fg=COLOR_TEXT_RECORDING)
-        self._dot_index = 0
-        self._animate_recording()
+        self._clear_content()
+        self._anim_index = 0
+        self._anim_recording()
 
-    def _animate_recording(self):
+    def _anim_recording(self):
+        """Animate recording: wave of golden dots pulsing left to right."""
         if self._current_state != "recording":
             return
-        dots = RECORDING_DOTS[self._dot_index % len(RECORDING_DOTS)]
-        self._status_label.configure(text=f"Recording{dots}")
-        colors = [COLOR_TEXT_RECORDING, "#00CC66", "#00FF88", "#00CC66"]
-        self._canvas.itemconfig(
-            self._dot_indicator, fill=colors[self._dot_index % len(colors)]
-        )
-        self._dot_index += 1
-        self._root.after(300, self._animate_recording)
+
+        self._canvas.delete("dots")
+        count = 14
+        spacing = 12
+        total_w = (count - 1) * spacing
+        start_x = (PILL_WIDTH - total_w) / 2
+        cy = PILL_HEIGHT / 2
+
+        for i in range(count):
+            x = start_x + i * spacing
+            # Wave effect: dots near the "active" position are brighter and larger
+            dist = abs(i - (self._anim_index % count))
+            dist = min(dist, count - dist)  # Wrap around
+
+            if dist == 0:
+                r, color = 4, DOT_RECORDING
+            elif dist == 1:
+                r, color = 3.5, "#C9952A"
+            elif dist == 2:
+                r, color = 3, "#8B6914"
+            else:
+                r, color = 2.5, "#3D3020"
+
+            self._canvas.create_oval(
+                x - r, cy - r, x + r, cy + r, fill=color, outline="", tags="dots"
+            )
+
+        self._draw_mode_icon()
+        self._anim_index += 1
+        self._anim_id = self._root.after(80, self._anim_recording)
 
     def _set_processing(self):
         self._current_state = "processing"
         self._cancel_result_timer()
         self._ensure_full()
-        self._set_bg(COLOR_BG_PROCESSING)
-        self._canvas.itemconfig(self._dot_indicator, fill=COLOR_TEXT_PROCESSING)
-        self._status_label.configure(text="Processing...", fg=COLOR_TEXT_PROCESSING)
-        self._text_label.configure(
-            text="Transcribing speech...", fg=COLOR_TEXT_PROCESSING
-        )
-        self._dot_index = 0
-        self._animate_processing()
+        self._clear_content()
+        self._anim_index = 0
+        self._anim_processing()
 
-    def _animate_processing(self):
+    def _anim_processing(self):
+        """Animate processing: rotating spinner dots."""
         if self._current_state != "processing":
             return
-        spinner = ["   ", ".  ", ".. ", "...", " ..", "  ."]
-        s = spinner[self._dot_index % len(spinner)]
-        self._status_label.configure(text=f"Processing {s}")
-        self._dot_index += 1
-        self._root.after(200, self._animate_processing)
+
+        self._canvas.delete("spinner")
+        cx = PILL_WIDTH / 2
+        cy = PILL_HEIGHT / 2
+        dot_count = 8
+        radius = 10
+
+        for i in range(dot_count):
+            angle = (2 * math.pi * i / dot_count) - (self._anim_index * 0.3)
+            x = cx + radius * math.cos(angle)
+            y = cy + radius * math.sin(angle)
+
+            # Fade effect
+            brightness = ((i + self._anim_index) % dot_count) / dot_count
+            r = 2 + brightness * 2
+            gray = int(40 + brightness * 140)
+            color = f"#{gray:02x}{int(gray * 0.9):02x}{int(gray * 1.1):02x}"
+
+            self._canvas.create_oval(
+                x - r, y - r, x + r, y + r, fill=color, outline="", tags="spinner"
+            )
+
+        self._draw_mode_icon()
+        self._anim_index += 1
+        self._anim_id = self._root.after(60, self._anim_processing)
 
     def _set_result(self, text: str):
         self._current_state = "result"
         self._cancel_result_timer()
         self._ensure_full()
-        self._set_bg(COLOR_BG_IDLE)
-        self._canvas.itemconfig(self._dot_indicator, fill="#00FF88")
-        self._status_label.configure(text="Injected", fg="#00FF88")
-        display = text if len(text) <= 80 else text[:77] + "..."
-        self._text_label.configure(text=display, fg=COLOR_TEXT_RESULT)
-        self._result_timer_id = self._root.after(RESULT_DISPLAY_MS, self._set_idle)
+        self._clear_content()
 
-    def _set_error(self, message: str):
+        # Show text briefly in the pill
+        display = text if len(text) <= 35 else text[:32] + "..."
+        self._canvas.create_text(
+            PILL_WIDTH / 2,
+            PILL_HEIGHT / 2,
+            text=display,
+            fill=DOT_RESULT,
+            font=("Segoe UI", 10),
+            tags="text",
+        )
+
+        self._result_timer_id = self._root.after(3000, self._set_idle)
+
+    def _set_error(self, msg: str):
         self._current_state = "error"
         self._cancel_result_timer()
         self._ensure_full()
-        self._set_bg(COLOR_BG_ERROR)
-        self._canvas.itemconfig(self._dot_indicator, fill=COLOR_TEXT_ERROR)
-        self._status_label.configure(text="Error", fg=COLOR_TEXT_ERROR)
-        self._text_label.configure(text=message, fg=COLOR_TEXT_ERROR)
-        self._result_timer_id = self._root.after(ERROR_DISPLAY_MS, self._set_idle)
+        self._clear_content()
+
+        display = msg if len(msg) <= 35 else msg[:32] + "..."
+        self._canvas.create_text(
+            PILL_WIDTH / 2,
+            PILL_HEIGHT / 2,
+            text=display,
+            fill=DOT_ERROR,
+            font=("Segoe UI", 10),
+            tags="text",
+        )
+
+        self._result_timer_id = self._root.after(4000, self._set_idle)
 
     def _set_mode(self, mode: str):
         self._current_mode = mode
-        # Show full UI briefly when mode changes
         self._ensure_full()
-
-        if mode == "translate":
-            self._translate_badge.configure(
-                text="  Translate: ON  ",
-                fg=COLOR_TRANSLATE_ON_FG,
-                bg=COLOR_TRANSLATE_ON_BG,
-            )
-            self._lang_badge.configure(
-                text=" KO -> EN ",
-                fg=COLOR_TRANSLATE_ON_FG,
-                bg="#1A2A3C",
-            )
-            if self._is_mini or self._mini_canvas:
-                self._mini_canvas.itemconfig(self._mini_dot, fill=COLOR_TRANSLATE_ON_FG)
+        # Redraw to update icon color
+        if self._current_state == "idle":
+            self._draw_idle_dots()
         else:
-            self._translate_badge.configure(
-                text="  Translate: OFF  ",
-                fg=COLOR_TRANSLATE_OFF_FG,
-                bg=COLOR_TRANSLATE_OFF_BG,
-            )
-            self._lang_badge.configure(
-                text=" KO / EN ",
-                fg="#999999",
-                bg="#2A2A2A",
-            )
-            if self._is_mini or self._mini_canvas:
-                self._mini_canvas.itemconfig(self._mini_dot, fill=COLOR_TEXT_IDLE)
+            self._draw_mode_icon()
 
-        # Restart auto-hide after mode change
-        self._start_auto_hide_timer()
+        # Update mini dot
+        color = TRANSLATE_ON if mode == "translate" else DOT_IDLE
+        self._mini_canvas.itemconfig(self._mini_dot, fill=color)
 
-    def _cancel_result_timer(self):
-        if self._result_timer_id is not None:
-            try:
-                self._root.after_cancel(self._result_timer_id)
-            except Exception:
-                pass
-            self._result_timer_id = None
+        self._start_hide_timer()
