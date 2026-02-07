@@ -12,7 +12,9 @@ from .glass_renderer import (
     DOT_COLOR,
     PAD,
     PILL_H,
+    PILL_R,
     PILL_W,
+    TEXT_BACKDROP,
     WAVE_FILL_HI,
     WAVE_FILL_LO,
     WAVE_MAX_H,
@@ -51,7 +53,11 @@ def draw_waveform(img, s, cx, cy, smooth, levels_func, alpha=1.0):
     step = ww / max(1, WAVE_POINTS - 1)
 
     for i in range(WAVE_POINTS):
-        smooth[i] = smooth[i] * 0.3 + levels[i] * 0.7
+        smooth[i] = smooth[i] * 0.55 + levels[i] * 0.45  # tuned for ~60fps
+
+    # Skip drawing if no actual audio — prevents thin-band artifact on quick tap
+    if max(smooth) < 0.02:
+        return smooth
 
     avg = sum(smooth) / len(smooth)
     t = min(1.0, avg * 2.5)
@@ -95,6 +101,17 @@ def draw_spinner(draw, s, cx, cy, ai, alpha=1.0):
 
 
 def draw_text(draw, s, cx, cy, text, state, font_func, alpha=1.0):
+    # Draw semi-opaque backdrop inside pill for text readability
+    pad = PAD * s
+    pw, ph, pr = PILL_W * s, PILL_H * s, PILL_R * s
+    bd_a = max(0, int(TEXT_BACKDROP[3] * alpha))
+    bd_color = TEXT_BACKDROP[:3] + (bd_a,)
+    draw.rounded_rectangle(
+        [pad, pad, pad + pw - 1, pad + ph - 1],
+        radius=pr,
+        fill=bd_color,
+    )
+
     txt = text
     if len(txt) > 28:
         txt = txt[:25] + "..."
@@ -114,9 +131,9 @@ def draw_badge(draw, s, mode, font_func, alpha=1.0):
     x2, y2 = bx + bw / 2, by + bh / 2
 
     if mode == "translate":
-        bg, fg, label = BADGE_ON_BG, BADGE_ON_FG, "번역"
+        bg, fg, label = BADGE_ON_BG, BADGE_ON_FG, "→EN"
     else:
-        bg, fg, label = BADGE_OFF_BG, BADGE_OFF_FG, "EN"
+        bg, fg, label = BADGE_OFF_BG, BADGE_OFF_FG, "자동"
 
     bgc = bg[:3] + (max(0, int(bg[3] * alpha)),)
     fgc = fg[:3] + (max(0, int(fg[3] * alpha)),)

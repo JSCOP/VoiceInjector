@@ -1,6 +1,7 @@
 """Floating overlay renderer and state orchestrator."""
 
 import collections
+import ctypes
 import logging
 import queue
 import threading
@@ -10,11 +11,19 @@ import winsound
 
 from PIL import Image, ImageDraw, ImageFont
 
+# Request 1ms timer resolution for smooth animations on high-refresh monitors
+try:
+    _winmm = ctypes.WinDLL("winmm")
+except Exception:
+    _winmm = None
+
 from .animation import (
     ANIM_INTERVAL_MS,
+    MORPH_DURATION,
     TRANS_FAST,
     TRANS_MEDIUM,
     TRANS_SLOW,
+    MorphTransition,
     TransitionState,
 )
 from .content_drawers import downsample_levels, draw_badge, draw_state_content
@@ -48,15 +57,20 @@ class OverlayWindow:
         self._mode = "transcribe"
         self._state = "idle"
         self._transition = TransitionState()
+        self._morph = MorphTransition()
         self._is_mini = False
-        self._ai = 0
+        self._ai = 0.0  # float: time-based spinner accumulator
         self._anim_id = None
         self._hide_id = None
         self._result_id = None
+        self._deferred_result_id = None
         self._result_text = ""
         self._last_tick = time.monotonic()
+        self._processing_start = 0.0
+        self._result_gen = 0  # generation token for deferred results
 
         self._sw = self._sh = 0
+        self._mon_x = self._mon_y = 0  # monitor work area origin
         self._win_x = self._win_y = 0
         self._bg_blur = None
         self._glass_cache = None
@@ -105,6 +119,10 @@ class OverlayWindow:
         self._mode = m
         self._cmd("mode", m)
 
+    def move_to_active_monitor(self):
+        """Reposition overlay to the monitor containing the foreground window."""
+        self._cmd("move_monitor")
+
     def push_audio_level(self, level):
         with self._level_lock:
             self._audio_levels.append(max(0.0, min(1.0, level)))
@@ -146,6 +164,8 @@ class OverlayWindow:
             pass
 
     def _run(self):
+        if _winmm:
+            _winmm.timeBeginPeriod(1)
         try:
             self._root = tk.Tk()
             self._root.withdraw()
@@ -155,13 +175,16 @@ class OverlayWindow:
             self._root.deiconify()
             self._make_layered()
             self._render_and_push()
-            self._root.after(50, self._poll)
+            self._root.after(ANIM_INTERVAL_MS, self._poll)
             self._start_hide()
             self._ready.set()
             self._root.mainloop()
         except Exception as e:
             logger.error(f"Overlay error: {e}", exc_info=True)
             self._ready.set()
+        finally:
+            if _winmm:
+                _winmm.timeEndPeriod(1)
 
     def _setup(self):
         r = self._root
@@ -170,8 +193,10 @@ class OverlayWindow:
         r.attributes("-topmost", True)
         self._sw = r.winfo_screenwidth()
         self._sh = r.winfo_screenheight()
-        self._win_x = (self._sw - WIN_W) // 2
-        self._win_y = self._sh - WIN_H - 60
+        self._mon_x = 0
+        self._mon_y = 0
+        self._win_x = self._mon_x + (self._sw - WIN_W) // 2
+        self._win_y = self._mon_y + self._sh - WIN_H - 60
         r.geometry(f"{WIN_W}x{WIN_H}+{self._win_x}+{self._win_y}")
 
     def _make_layered(self):
@@ -259,6 +284,57 @@ class OverlayWindow:
         draw.ellipse([s, s, sz - s, sz - s], fill=c)
         return img.resize((MINI_SIZE, MINI_SIZE), Image.LANCZOS)
 
+    def _render_morph(self, ep, cx, cy, cw, ch):
+        """Render an intermediate frame during mini↔full morphing.
+        Uses BILINEAR for speed during animation (LANCZOS only on final frame)."""
+        if self._is_mini:
+            # Shrinking: full → mini. Render full pill, scale down, fade to dot.
+            full_img = self._render_full()
+            if cw > 0 and ch > 0:
+                morph_img = full_img.resize((cw, ch), Image.BILINEAR)
+                # Fade out the pill as it shrinks
+                alpha_mult = 1.0 - ep
+                if alpha_mult < 1.0:
+                    a = morph_img.split()[3]
+                    a = a.point(lambda p: int(p * alpha_mult))
+                    morph_img.putalpha(a)
+                # Blend with mini dot fading in
+                mini_img = self._render_mini()
+                canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+                canvas = Image.alpha_composite(canvas, morph_img)
+                if ep > 0.3:
+                    dot_alpha = min(1.0, (ep - 0.3) / 0.7)
+                    dot = mini_img.copy()
+                    da = dot.split()[3]
+                    da = da.point(lambda p: int(p * dot_alpha))
+                    dot.putalpha(da)
+                    dx = (cw - MINI_SIZE) // 2
+                    dy = (ch - MINI_SIZE) // 2
+                    canvas.paste(dot, (max(0, dx), max(0, dy)), dot)
+                self._layer.push_image(canvas, cx, cy)
+        else:
+            # Expanding: mini → full. Start from dot, morph to full pill.
+            if cw > 0 and ch > 0:
+                full_img = self._render_full()
+                morph_img = full_img.resize((cw, ch), Image.BILINEAR)
+                if ep < 1.0:
+                    a = morph_img.split()[3]
+                    a = a.point(lambda p: int(p * ep))
+                    morph_img.putalpha(a)
+                self._layer.push_image(morph_img, cx, cy)
+
+    def _finalize_morph(self):
+        """Finalize after morph completes — set final geometry."""
+        if self._is_mini:
+            self._win_x = self._morph.to_rect[0]
+            self._win_y = self._morph.to_rect[1]
+            self._root.geometry(f"{MINI_SIZE}x{MINI_SIZE}+{self._win_x}+{self._win_y}")
+            self._render_and_push()
+        else:
+            self._win_x = self._morph.to_rect[0]
+            self._win_y = self._morph.to_rect[1]
+            self._render_and_push()
+
     def _downsample_levels(self):
         with self._level_lock:
             raw = list(self._audio_levels)
@@ -274,7 +350,7 @@ class OverlayWindow:
                 self._handle(c, d)
         except queue.Empty:
             pass
-        self._root.after(50, self._poll)
+        self._root.after(ANIM_INTERVAL_MS, self._poll)
 
     def _handle(self, cmd, data):
         handlers = {
@@ -285,6 +361,7 @@ class OverlayWindow:
             "result": lambda: self._set_result(data),
             "error": lambda: self._set_error(data),
             "mode": lambda: self._set_mode(data),
+            "move_monitor": self._move_to_monitor,
         }
         fn = handlers.get(cmd)
         if fn:
@@ -299,23 +376,45 @@ class OverlayWindow:
     def _anim_tick(self):
         if not self._running:
             return
-        self._last_tick = time.monotonic()
+        now = time.monotonic()
+        dt = now - self._last_tick
+        self._last_tick = now
         if self._state == "processing":
-            self._ai += 1
-        self._render_and_push()
-        if self._transition.active or self._state in ("recording", "processing"):
-            self._anim_id = self._root.after(ANIM_INTERVAL_MS, self._anim_tick)
+            self._ai += dt * 30.0  # equivalent to +1 per frame at original 30fps
+
+        if self._morph.active:
+            ep, (cx, cy, cw, ch) = self._morph.update()
+            self._render_morph(ep, cx, cy, cw, ch)
+            if self._morph.active:
+                self._anim_id = self._root.after(ANIM_INTERVAL_MS, self._anim_tick)
+            else:
+                # Morph complete — finalize geometry
+                self._finalize_morph()
+                # Continue animation if content needs it
+                if self._transition.active or self._state in (
+                    "recording",
+                    "processing",
+                ):
+                    self._anim_id = self._root.after(ANIM_INTERVAL_MS, self._anim_tick)
+                else:
+                    self._anim_id = None
         else:
-            self._anim_id = None
+            self._render_and_push()
+            if self._transition.active or self._state in ("recording", "processing"):
+                self._anim_id = self._root.after(ANIM_INTERVAL_MS, self._anim_tick)
+            else:
+                self._anim_id = None
 
     def _set_idle(self):
         self._cancel_result()
+        self._cancel_deferred_result()
         self._ensure_full()
         self._begin_transition("idle", TRANS_SLOW)
         self._start_hide()
 
     def _set_recording(self):
         self._cancel_result()
+        self._cancel_deferred_result()
         self._ensure_full()
         with self._level_lock:
             self._audio_levels.clear()
@@ -325,13 +424,37 @@ class OverlayWindow:
 
     def _set_processing(self):
         self._cancel_result()
+        self._cancel_deferred_result()
         self._ensure_full()
-        self._ai = 0
+        self._ai = 0.0
+        self._processing_start = time.monotonic()
         self._begin_transition("processing", TRANS_FAST)
+
+    _MIN_PROCESSING_DISPLAY = 0.35  # seconds — minimum spinner visibility
 
     def _set_result(self, text):
         self._result_text = text
         self._cancel_result()
+        self._cancel_deferred_result()
+
+        # Ensure spinner is visible for minimum duration before showing result
+        elapsed = time.monotonic() - self._processing_start
+        if elapsed < self._MIN_PROCESSING_DISPLAY and self._state == "processing":
+            delay_ms = int((self._MIN_PROCESSING_DISPLAY - elapsed) * 1000)
+            self._result_gen += 1
+            gen = self._result_gen
+            self._deferred_result_id = self._root.after(
+                delay_ms, lambda: self._finish_result(text, gen)
+            )
+            return
+
+        self._finish_result(text, self._result_gen)
+
+    def _finish_result(self, text, gen):
+        """Actually display result. Guarded by generation token to prevent stale results."""
+        if gen != self._result_gen:
+            return  # stale deferred callback — a new recording started
+        self._result_text = text
         self._ensure_full()
         self._begin_transition("result", TRANS_MEDIUM)
         self._result_id = self._root.after(3000, self._set_idle)
@@ -339,6 +462,7 @@ class OverlayWindow:
     def _set_error(self, msg):
         self._result_text = msg
         self._cancel_result()
+        self._cancel_deferred_result()
         self._ensure_full()
         self._begin_transition("error", TRANS_MEDIUM)
         self._result_id = self._root.after(4000, self._set_idle)
@@ -356,23 +480,63 @@ class OverlayWindow:
         self._cancel_result()
         self._result_id = self._root.after(1500, self._set_idle)
 
+    def _move_to_monitor(self):
+        """Reposition overlay onto the monitor with the foreground window."""
+        rect = self._layer.get_active_monitor_rect()
+        if not rect:
+            return
+        mx, my, mw, mh = rect
+        if (
+            mx == self._mon_x
+            and my == self._mon_y
+            and mw == self._sw
+            and mh == self._sh
+        ):
+            return  # already on this monitor
+        self._mon_x, self._mon_y = mx, my
+        self._sw, self._sh = mw, mh
+        if self._is_mini:
+            self._win_x = mx + (mw - MINI_SIZE) // 2
+            self._win_y = my + mh - MINI_SIZE - 68
+            self._root.geometry(f"{MINI_SIZE}x{MINI_SIZE}+{self._win_x}+{self._win_y}")
+        else:
+            self._win_x = mx + (mw - WIN_W) // 2
+            self._win_y = my + mh - WIN_H - 60
+            self._root.geometry(f"{WIN_W}x{WIN_H}+{self._win_x}+{self._win_y}")
+        self._capture_desktop()
+        self._build_glass_cache()
+        self._render_and_push()
+        logger.debug(f"Overlay moved to monitor at ({mx},{my}) {mw}x{mh}")
+
     def _to_full(self):
         if not self._is_mini:
             return
         self._is_mini = False
-        self._win_x = (self._sw - WIN_W) // 2
-        self._win_y = self._sh - WIN_H - 60
-        self._root.geometry(f"{WIN_W}x{WIN_H}+{self._win_x}+{self._win_y}")
-        self._render_and_push()
+        # Capture glass for the full-size position before morphing
+        new_x = self._mon_x + (self._sw - WIN_W) // 2
+        new_y = self._mon_y + self._sh - WIN_H - 60
+        self._capture_desktop()
+        self._build_glass_cache()
+        from_rect = (self._win_x, self._win_y, MINI_SIZE, MINI_SIZE)
+        to_rect = (new_x, new_y, WIN_W, WIN_H)
+        self._win_x, self._win_y = new_x, new_y
+        # Set tkinter geometry to full size so HWND is large enough
+        self._root.geometry(f"{WIN_W}x{WIN_H}+{new_x}+{new_y}")
+        self._morph.begin(from_rect, to_rect, MORPH_DURATION)
+        self._cancel_anim()
+        self._anim_tick()
 
     def _to_mini(self):
         if self._is_mini or self._state != "idle":
             return
         self._is_mini = True
-        self._win_x = (self._sw - MINI_SIZE) // 2
-        self._win_y = self._sh - MINI_SIZE - 68
-        self._root.geometry(f"{MINI_SIZE}x{MINI_SIZE}+{self._win_x}+{self._win_y}")
-        self._render_and_push()
+        new_x = self._mon_x + (self._sw - MINI_SIZE) // 2
+        new_y = self._mon_y + self._sh - MINI_SIZE - 68
+        from_rect = (self._win_x, self._win_y, WIN_W, WIN_H)
+        to_rect = (new_x, new_y, MINI_SIZE, MINI_SIZE)
+        self._morph.begin(from_rect, to_rect, MORPH_DURATION)
+        self._cancel_anim()
+        self._anim_tick()
 
     def _ensure_full(self):
         if self._is_mini:
@@ -398,6 +562,15 @@ class OverlayWindow:
             except Exception:
                 pass
             self._result_id = None
+
+    def _cancel_deferred_result(self):
+        self._result_gen += 1  # invalidate any pending deferred callback
+        if self._deferred_result_id:
+            try:
+                self._root.after_cancel(self._deferred_result_id)
+            except Exception:
+                pass
+            self._deferred_result_id = None
 
     def _cancel_anim(self):
         if self._anim_id:

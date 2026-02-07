@@ -41,7 +41,12 @@ def key_to_name(key) -> Optional[str]:
     try:
         if hasattr(key, "char") and key.char is not None:
             return key.char.lower()
-        elif hasattr(key, "name"):
+        elif hasattr(key, "vk") and key.vk is not None:
+            # Handle keys that lose their char when Alt is held (WM_SYSKEYDOWN)
+            vk = key.vk
+            if vk == 0xC0:  # VK_OEM_3 = backtick/tilde
+                return "`"
+        if hasattr(key, "name") and key.name is not None:
             name = key.name.lower()
             if name in ("ctrl_l", "ctrl_r"):
                 return "ctrl"

@@ -35,6 +35,12 @@ BADGE_OFF_FG = (255, 255, 255, 120)
 
 COLOR_RESULT = (255, 255, 255, 230)
 COLOR_ERROR = (255, 120, 120, 230)
+TEXT_BACKDROP = (
+    15,
+    17,
+    22,
+    140,
+)  # dark semi-opaque backdrop behind text for readability
 
 LEVEL_BUF = 48
 AUTO_HIDE_MS = 1000
@@ -151,6 +157,7 @@ __all__ = [
     "BADGE_OFF_FG",
     "COLOR_RESULT",
     "COLOR_ERROR",
+    "TEXT_BACKDROP",
     "LEVEL_BUF",
     "AUTO_HIDE_MS",
     "_lerp",

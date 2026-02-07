@@ -45,7 +45,7 @@ hotkeys:
   # Push-to-talk hotkey (hold to record)
   push_to_talk: win+ctrl
   # Toggle transcribe/translate mode
-  toggle_mode: win+shift
+  toggle_mode: win+`
   # Quick quit
   quit: ctrl+shift+q
 

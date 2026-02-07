@@ -56,7 +56,7 @@ python main.py -v           # Verbose logging
 | Hotkey | Action |
 |---|---|
 | `Win+Ctrl` (hold) | **Push-to-talk**: hold, speak, release to inject text |
-| `Win+Shift` | Toggle **Translate** mode (Korean → English) |
+| `Alt+`` | Toggle **Translate** mode (Korean → English) |
 | `Ctrl+Shift+Q` | Quit |
 
 ## Overlay UI

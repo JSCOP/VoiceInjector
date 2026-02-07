@@ -15,6 +15,7 @@ WS_EX_NOACTIVATE = 0x08000000
 ULW_ALPHA = 2
 AC_SRC_OVER = 0
 AC_SRC_ALPHA = 1
+MONITOR_DEFAULTTONEAREST = 2
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -52,6 +53,15 @@ user32.UpdateLayeredWindow.argtypes = [
 ]
 user32.UpdateLayeredWindow.restype = wt.BOOL
 
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = _PTR
+
+user32.MonitorFromWindow.argtypes = [_PTR, wt.DWORD]
+user32.MonitorFromWindow.restype = _PTR
+
+user32.GetMonitorInfoW.argtypes = [_PTR, ctypes.c_void_p]
+user32.GetMonitorInfoW.restype = wt.BOOL
+
 gdi32.CreateCompatibleDC.argtypes = [_PTR]
 gdi32.CreateCompatibleDC.restype = _PTR
 
@@ -73,6 +83,15 @@ gdi32.DeleteObject.restype = wt.BOOL
 
 gdi32.DeleteDC.argtypes = [_PTR]
 gdi32.DeleteDC.restype = wt.BOOL
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("rcMonitor", wt.RECT),
+        ("rcWork", wt.RECT),
+        ("dwFlags", wt.DWORD),
+    ]
 
 
 class BLENDFUNCTION(ctypes.Structure):
@@ -145,6 +164,26 @@ class LayeredWindow:
             logger.warning(
                 f"SetWindowLongW returned 0, last error: {ctypes.get_last_error()}"
             )
+
+    @staticmethod
+    def get_active_monitor_rect():
+        """Get the work area (left, top, width, height) of the monitor
+        containing the current foreground window."""
+        try:
+            fg = user32.GetForegroundWindow()
+            if not fg:
+                return None
+            hmon = user32.MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST)
+            if not hmon:
+                return None
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                return None
+            rc = mi.rcWork  # work area excludes taskbar
+            return (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top)
+        except Exception:
+            return None
 
     def push_image(self, pil_img, win_x, win_y):
         if not self.hwnd:

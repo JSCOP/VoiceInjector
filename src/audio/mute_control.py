@@ -99,5 +99,7 @@ class MuteControl:
 
         try:
             self._volume.SetMute(0, None)
+            self._was_muted_before = False
+            logger.debug("Speaker force-unmuted")
         except Exception:
             pass

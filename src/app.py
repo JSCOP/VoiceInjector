@@ -41,6 +41,7 @@ class VoiceInjectorApp:
         self.config = config or load_config()
         self._running = False
         self._is_recording = False
+        self._ptt_lock = threading.Lock()
         self._processing_lock = threading.Lock()
 
         # Initialize components
@@ -116,32 +117,42 @@ class VoiceInjectorApp:
 
     def _on_ptt_press(self):
         """Called when push-to-talk hotkey is pressed (held down)."""
-        if self._is_recording:
-            return
+        with self._ptt_lock:
+            if self._is_recording:
+                return
 
-        self._is_recording = True
-        # Play start sound BEFORE muting — blocks until sound finishes
-        self._overlay.play_start_sound()
-        self._mute.mute()  # Mute speakers to avoid interference
-        self._vad.reset()
-        self._audio.start_buffering()
-        self._tray.update_status("listening")
-        self._overlay.show_recording()
-        logger.info("Push-to-talk: RECORDING")
+            self._is_recording = True
+            try:
+                # Move overlay to the monitor with the active window
+                self._overlay.move_to_active_monitor()
+                # Play start sound BEFORE muting — blocks until sound finishes
+                self._overlay.play_start_sound()
+                self._mute.mute()  # Mute speakers to avoid interference
+                self._vad.reset()
+                self._audio.start_buffering()
+                self._tray.update_status("listening")
+                self._overlay.show_recording()
+                logger.info("Push-to-talk: RECORDING")
+            except Exception as e:
+                logger.error(f"PTT press failed: {e}", exc_info=True)
+                self._is_recording = False
+                self._mute.force_unmute()
 
     def _on_ptt_release(self):
         """Called when push-to-talk hotkey is released."""
-        if not self._is_recording:
-            return
+        with self._ptt_lock:
+            if not self._is_recording:
+                return
 
-        self._is_recording = False
+            self._is_recording = False
+
         logger.info("Push-to-talk: RELEASED - processing audio...")
 
         # Get buffered audio
         audio_data = self._audio.stop_buffering()
 
-        # Unmute speakers THEN play stop sound so the user can hear it
-        self._mute.unmute()
+        # Always force unmute to prevent stuck mute state
+        self._mute.force_unmute()
         self._overlay.play_stop_sound()
 
         if not audio_data or len(audio_data) < 1000:
@@ -262,3 +273,8 @@ class VoiceInjectorApp:
         self._tray.stop()
 
         logger.info("Voice Injector stopped. Goodbye!")
+
+        # Force exit to avoid lingering threads (pynput hooks, pystray, etc.)
+        import os
+
+        os._exit(0)
